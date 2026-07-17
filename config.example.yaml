@@ -1,0 +1,32 @@
+server:
+  host: -
+  port: -
+
+database:
+  host: -
+  port: -
+  name: example_db
+  username: your_username
+  password: your_password
+
+redis:
+  host: -
+  port: -
+
+clickhouse:
+  host: -
+
+dolphindb:
+  host: -
+  port: -
+  username: your_username
+  password: your_password
+  host: -
+
+api:
+  key: your_api_key
+  access_token: your_access_token
+rqdata:
+  license_key: your_rq_license_key
+  username: your_username
+  password: your_password

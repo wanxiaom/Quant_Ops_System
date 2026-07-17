@@ -1,0 +1,21 @@
+[Unit]
+Description=Quant Ops System Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wanxm
+Group=wanxm
+
+WorkingDirectory=/home/wanxm/ops_maintenance/quant_ops_system
+ExecStart=/home/wanxm/miniconda3/bin/python src/agent/linux_agent.py
+
+Environment="MANAGER_URL=http://127.0.0.1:8000"
+Environment="NODE_ID=linux-worker-01"
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: quant_mysql
+    command: --default-authentication-plugin=mysql_native_password --default-time-zone=+08:00
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ops_password
+      MYSQL_DATABASE: quant_ops
+    ports:
+      - "13306:3306"
+    volumes:
+      # 挂载初始化脚本，MySQL 首次启动时会自动执行以建立表结构
+      - ../db/migrations:/docker-entrypoint-initdb.d
+      - mysql_data:/var/lib/mysql
+    networks:
+      - quant_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: quant_redis
+    ports:
+      - "16379:6379"
+    networks:
+      - quant_net
+
+networks:
+  quant_net:
+    driver: bridge
+
+volumes:
+  mysql_data:

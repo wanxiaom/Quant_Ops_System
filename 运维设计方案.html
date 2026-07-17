@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>分布式运维管理系统设计文档</title>
+<style>
+    body {
+        font-family: '宋体', 'SimSun', 'Times New Roman', serif;
+        margin: 2cm auto;
+        width: 90%;
+        line-height: 1.4;
+    }
+    h1 {
+        font-size: 22pt;
+        text-align: center;
+        margin-top: 30pt;
+        margin-bottom: 20pt;
+        page-break-after: avoid;
+    }
+    h2 {
+        font-size: 18pt;
+        margin-top: 25pt;
+        margin-bottom: 12pt;
+        border-bottom: 1px solid #aaa;
+        page-break-after: avoid;
+    }
+    h3 {
+        font-size: 16pt;
+        margin-top: 20pt;
+        margin-bottom: 10pt;
+        page-break-after: avoid;
+    }
+    p {
+        font-size: 12pt;
+        text-indent: 2em;
+        margin: 6pt 0;
+    }
+    pre, code {
+        font-family: 'Courier New', monospace;
+        font-size: 10pt;
+        background-color: #f4f4f4;
+        border: 1px solid #ddd;
+        padding: 8px;
+        display: block;
+        white-space: pre-wrap;
+        margin: 12pt 0;
+    }
+    table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 12pt 0;
+        font-size: 11pt;
+    }
+    th, td {
+        border: 1px solid #666;
+        padding: 6px 8px;
+        vertical-align: top;
+    }
+    th {
+        background-color: #e0e0e0;
+        font-weight: bold;
+    }
+    .ascii-art {
+        font-family: 'Courier New', monospace;
+        font-size: 9pt;
+        background-color: #f8f8f8;
+        border: 1px dashed #ccc;
+        padding: 8px;
+        white-space: pre;
+        overflow-x: auto;
+    }
+    .note {
+        background: #fef9e6;
+        border-left: 4px solid #f0ad4e;
+        padding: 8px 12px;
+        margin: 12pt 0;
+    }
+    hr {
+        margin: 20pt 0;
+    }
+</style>
+</head>
+<body>
+
+<h1>分布式运维管理系统设计文档</h1>
+
+<h2>一、系统总体架构（文本描述）</h2>
+
+<div class="ascii-art">
+┌─────────────────────────────────────────────────────────────────┐
+│                          用户层                                  │
+│   ┌──────────────┐         ┌──────────────┐                     │
+│   │  运维人员     │ ◄─────► │  Vue 3 前端   │                     │
+│   └──────────────┘         └──────────────┘                     │
+│                                      │                          │
+│                                      │ HTTP / WebSocket         │
+└──────────────────────────────────────┼──────────────────────────┘
+                                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   管理端 (C++ + libhv + ormpp)                   │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
+│  │ HTTP API    │  │ WebSocket   │  │ DAG 调度器  │               │
+│  │ 网关        │  │ 推送服务     │  │ (任务依赖)   │              │
+│  └─────────────┘  └─────────────┘  └─────────────┘              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
+│  │ 节点管理器   │  │ 日志聚合器   │  │ ormpp ORM   │              │
+│  │(心跳/指令)   │  │(缓冲/检索)  │  │(MySQL连接池)│              │
+│  └─────────────┘  └─────────────┘  └─────────────┘              │
+└───────────────────────────┬─────────────────┬───────────────────┘
+                            │                 │
+              ┌─────────────┼─────────────────┼─────────────┐
+              │             │                 │             │
+              ▼             ▼                 ▼             ▼
+        ┌──────────┐  ┌──────────┐     ┌──────────┐   ┌──────────┐
+        │  MySQL   │  │  Redis   │     │ Linux    │   │ Windows  │
+        │(元数据)   │  │(队列/缓存)│     │ Agent    │   │ Agent    │
+        └──────────┘  └──────────┘     │(Python)  │   │(Python)  │
+                                        └────┬─────┘   └────┬─────┘
+                                             │              │
+                                             ▼              ▼
+                                   ┌─────────────────────────────┐
+                                   │   现有 ETL 脚本              │
+                                   │ (米筐/万得/本地缓存/重试机制)  │
+                                   └─────────────────────────────┘
+
+        ┌──────────┐                ┌──────────┐
+        │DolphinDB │ ◄──────────────│ 管理端    │
+        │ 内置Agent │ (通过HTTP API) │ (C++)    │
+        └──────────┘                └──────────┘
+</div>
+
+<p><strong>核心通信链路：</strong></p>
+<ul>
+<li>前端 ↔ 管理端：HTTP REST + WebSocket 实时推送任务状态和日志</li>
+<li>管理端 ↔ Agent：Agent 主动发起 HTTP 长轮询或 WebSocket 连接，拉取任务指令并回传执行结果</li>
+<li>管理端 ↔ 数据库：通过 ormpp 连接池访问 MySQL，Redis 用于任务队列和状态缓存</li>
+<li>Agent ↔ 现有脚本：通过 subprocess 调用，完全不修改原有 Python/Shell 逻辑</li>
+</ul>
+
+<h2>二、分布式更新节点设计（重点）</h2>
+
+<p>每个分布式节点上运行一个 <strong>轻量 Agent</strong>，负责接收管理端下发的指令、执行 ETL 脚本、上报执行结果和心跳。</p>
+
+<h3>2.1 Linux Agent（Python 实现）</h3>
+
+<p><strong>部署环境：</strong> Ubuntu/CentOS 服务器，已部署原有 <code>quant_data</code> 项目及 crontab 任务。</p>
+<p><strong>功能模块：</strong></p>
+
+<table>
+<tr><th>模块</th><th>说明</th></tr>
+<tr><td>心跳上报</td><td>上报 CPU、内存、正在运行的任务列表</td></tr>
+<tr><td>任务拉取</td><td>长轮询或 WebSocket 连接，接收管理端指令</td></tr>
+<tr><td>脚本执行器</td><td>通过 subprocess 隔离执行 Python/Shell 脚本</td></tr>
+<tr><td>日志采集</td><td>实时采集 stdout/stderr，压缩上传</td></tr>
+<tr><td>并发控制</td><td>限制同时运行的子进程数量（可选）</td></tr>
+</table>
+
+<p><strong>与现有系统的集成细节：</strong></p>
+
+<table>
+<tr><th>现有资产</th><th>集成方式</th><th>示例</th></tr>
+<tr><td><code>screen -r quant_data</code> 会话</td><td>Agent 不再依赖 screen，直接拉起脚本</td><td><code>Popen(["python", "/home/.../market/download.py"])</code></td></tr>
+<tr><td>Crontab 定时任务</td><td>停用 crontab，改由管理端下发调度策略</td><td>原 <code>30 16 * * *</code> → 管理端配置 cron</td></tr>
+<tr><td>本地缓存 (Pickle/Parquet)</td><td>完全保留，Agent 不干预</td><td>脚本内 <code>pickle.load</code> 不变</td></tr>
+<tr><td>连接重试、差分更新</td><td>保留在脚本内部</td><td>脚本返回 0 成功，非 0 失败</td></tr>
+</table>
+
+<p><strong>核心代码骨架（Python）：</strong></p>
+<pre><code>import subprocess, requests, time, json, psutil, socket
+from pathlib import Path
+
+class LinuxAgent:
+    def __init__(self, manager_url, node_id):
+        self.manager = manager_url.rstrip('/')
+        self.node_id = node_id
+        self.session = requests.Session()
+        
+    def _get_heartbeat_payload(self):
+        return {
+            "node_id": self.node_id,
+            "ip": socket.gethostbyname(socket.gethostname()),
+            "os_type": "linux",
+            "last_heartbeat": time.time(),
+            "cpu_load": psutil.cpu_percent(interval=1),
+            "mem_usage": psutil.virtual_memory().percent,
+            "running_tasks": self._get_running_subprocesses()
+        }
+    
+    def _heartbeat_loop(self, interval=30):
+        while True:
+            try:
+                resp = self.session.post(f"{self.manager}/api/agents/heartbeat",
+                                         json=self._get_heartbeat_payload(), timeout=10)
+                if resp.status_code != 200:
+                    print("Heartbeat failed")
+            except Exception as e:
+                print(f"Heartbeat error: {e}")
+            time.sleep(interval)
+    
+    def _execute_task(self, task):
+        script_path = Path(task["script_path"])
+        if not script_path.exists():
+            return {"exit_code": -1, "stderr": f"Script {script_path} not found"}
+        cmd = [task.get("interpreter", "python3"), str(script_path)]
+        for k, v in task.get("params", {}).items():
+            cmd.append(f"--{k}")
+            if v is not None:
+                cmd.append(str(v))
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, stderr = proc.communicate(timeout=task.get("timeout", 3600))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            return {"exit_code": -2, "stderr": "Timeout expired", "stdout": stdout}
+        return {
+            "exit_code": proc.returncode,
+            "stdout": stdout[-10000:],
+            "stderr": stderr[-10000:]
+        }
+    
+    def _task_pull_loop(self):
+        while True:
+            try:
+                resp = self.session.post(f"{self.manager}/api/tasks/poll",
+                                         json={"node_id": self.node_id, "timeout": 60}, timeout=70)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("task"):
+                        task = data["task"]
+                        result = self._execute_task(task)
+                        self.session.post(f"{self.manager}/api/tasks/callback",
+                                          json={"exec_id": task["exec_id"], **result})
+            except Exception as e:
+                print(f"Poll error: {e}")
+            time.sleep(1)
+    
+    def run(self):
+        import threading
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        self._task_pull_loop()
+</code></pre>
+
+<p><strong>部署方式：</strong> 作为 systemd 服务，开机自启，自动重启。</p>
+
+<h3>2.2 Windows Agent（Python 实现）</h3>
+
+<p><strong>部署环境：</strong> Windows 10/Server 办公机，必须保留 Wind 图形客户端。</p>
+<p><strong>特殊挑战：</strong> Wind API (<code>WindPy</code>) 需要有 GUI 的 Windows 环境；原有 <code>main.py</code> 使用 <code>concurrent.futures</code> 并行执行任务字典；需要兼容现有任务计划程序的双轨运行。</p>
+<p><strong>设计思路：</strong> Agent 作为包装器，通过进程调用现有脚本。</p>
+
+<p><strong>集成策略：</strong></p>
+
+<table>
+<tr><th>场景</th><th>做法</th></tr>
+<tr><td>管理端下发“更新ST股票”</td><td><code>python st_stock_list.py --date 2026-06-03</code></td></tr>
+<tr><td>管理端下发“全量更新”</td><td><code>python main.py</code>（Agent 仅监控进程）</td></tr>
+<tr><td>增量补数</td><td>传递 <code>--start_date</code> 参数给 <code>download_data_from_wind_wsd.py</code></td></tr>
+</table>
+
+<p><strong>核心代码片段：</strong></p>
+<pre><code>def run_windows_task(task):
+    script = task["script_path"]
+    cmd = ["python", script]
+    for k, v in task.get("params", {}).items():
+        cmd.extend([f"--{k}", str(v)])
+    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = proc.communicate(timeout=task.get("timeout", 3600))
+    return {"exit_code": proc.returncode, "stdout": stdout, "stderr": stderr}
+</code></pre>
+
+<p><strong>部署方式：</strong> 打包为 Windows 服务（PyInstaller + <code>sc create</code>）或后台进程。</p>
+
+<h3>2.3 DolphinDB 节点处理</h3>
+
+<p><strong>方案一（推荐）：</strong> 不单独部署 Agent，将 DolphinDB 的库内计算脚本（如 <code>all_databases.py</code>）视为普通 Python 任务，调度到一台可访问 DolphinDB 的 Linux 节点执行。该节点安装 <code>dolphindb</code> Python 包即可。</p>
+<p><strong>方案二（利用 DolphinDB 定时作业）：</strong> DolphinDB 内置 HTTP 接口，管理端可通过 POST 触发脚本。<br/>
+示例：<code>curl -X POST http://dolphin-ip:8848/api/run -d '{"script": "runAllDatabases()"}'</code></p>
+<p><strong>实际建议：</strong> 采用方案一，保持 Agent 类型统一，降低复杂度。</p>
+
+<h3>2.4 Agent 通用设计原则</h3>
+
+<table>
+<tr><th>设计点</th><th>要求</th></tr>
+<tr><td>轻量</td><td>内存占用 &lt; 50MB</td></tr>
+<tr><td>无状态</td><td>重启后重新注册，任务重试由管理端负责</td></tr>
+<tr><td>容错</td><td>断连时不缓存任务，重连后重新拉取</td></tr>
+<tr><td>安全</td><td>只执行管理端下发的任务，不暴露额外接口</td></tr>
+<tr><td>日志</td><td>实时回传 stdout/stderr，管理端最终写入 ES</td></tr>
+</table>
+
+<h2>三、管理端核心实现（C++ + libhv + ormpp）</h2>
+
+<h3>3.1 libhv HTTP/WebSocket 服务</h3>
+
+<p><strong>基础服务代码：</strong></p>
+<pre><code>#include "hv/HttpServer.h"
+#include "hv/WebSocketServer.h"
+#include "hv/hlog.h"
+
+class ApiResponse {
+public:
+    static void Success(HttpResponse* resp, const Json& data) {
+        Json json;
+        json["code"] = 0;
+        json["message"] = "success";
+        json["data"] = data;
+        resp->Json(json);
+    }
+    static void Error(HttpResponse* resp, int code, const std::string& msg) {
+        Json json;
+        json["code"] = code;
+        json["message"] = msg;
+        resp->Json(json);
+    }
+};
+
+void TaskApi::incrUpdate(HttpRequest* req, HttpResponse* resp) {
+    Json body = req->json();
+    std::string taskId = body.value("task_id", "");
+    std::string startDate = body.value("start_date", "");
+    // 参数校验与调用
+    bool ok = taskService->triggerTask(taskId, startDate, body.value("symbols", std::vector&lt;std::string&gt;()));
+    if (ok) ApiResponse::Success(resp, {{"msg", "task triggered"}});
+    else ApiResponse::Error(resp, 500, "trigger failed");
+}
+
+int main() {
+    HttpService router;
+    router.GET("/api/tasks", TaskApi::listTasks);
+    router.POST("/api/tasks/{task_id}/incr", TaskApi::incrUpdate);
+    router.STATIC("/", "./web_dist");
+    
+    http_server_t server;
+    server.port = 8080;
+    server.service = &router;
+    http_server_run(&server, 0);
+    return 0;
+}
+</code></pre>
+
+<h3>3.2 ormpp 数据库操作</h3>
+
+<pre><code>#include &lt;ormpp/mysql.hpp&gt;
+#include &lt;ormpp/connection_pool.hpp&gt;
+
+struct Task {
+    std::string task_id;
+    std::string name;
+    std::string node_type;
+    std::string script_path;
+    std::string cron_expr;
+    std::string dag_parents;
+    int timeout_sec = 3600;
+    int enabled = 1;
+};
+REFLECTION(Task, task_id, name, node_type, script_path, cron_expr, dag_parents, timeout_sec, enabled);
+
+class Database {
+public:
+    bool init() {
+        auto&amp; pool = ormpp::connection_pool&lt;ormpp::mysql&gt;::instance();
+        return pool.init(8, "127.0.0.1", "root", "password", "task_mgmt", 3306);
+    }
+    template&lt;typename Func&gt;
+    auto execute(Func&amp;&amp; func) {
+        auto conn = ormpp::connection_pool&lt;ormpp::mysql&gt;::instance().get();
+        return func(conn);
+    }
+};
+</code></pre>
+
+<h2>四、Docker 部署配置</h2>
+
+<p><strong>docker-compose.yml：</strong></p>
+<pre><code>version: '3.8'
+services:
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: task_mgmt
+    volumes: [mysql-data:/var/lib/mysql]
+  redis:
+    image: redis:7-alpine
+  manager:
+    build: ./manager
+    ports: ["8080:8080"]
+    volumes:
+      - /home/public/projects/quant_data:/mnt/scripts
+      - ./web_dist:/app/web_dist
+    depends_on: [mysql, redis]
+</code></pre>
+
+<p><strong>管理端 Dockerfile：</strong></p>
+<pre><code>FROM ubuntu:22.04 as builder
+RUN apt update &amp;&amp; apt install -y cmake g++ libssl-dev libmysqlclient-dev
+COPY libhv /src/libhv
+COPY ormpp /src/ormpp
+COPY src /src/manager
+RUN cd /src/libhv && mkdir build && cd build && cmake .. && make -j && make install
+RUN cd /src/manager &amp;&amp; mkdir build &amp;&amp; cd build &amp;&amp; \
+    cmake -DCMAKE_BUILD_TYPE=Release .. &amp;&amp; make -j
+FROM ubuntu:22.04
+RUN apt update &amp;&amp; apt install -y libssl-dev libmysqlclient21
+COPY --from=builder /src/manager/build/manager /usr/local/bin/
+COPY --from=builder /src/libhv/build/libhv.so /usr/local/lib/
+RUN ldconfig
+EXPOSE 8080
+CMD ["manager"]
+</code></pre>
+
+<h2>五、前后端接口约定（Vue 3 对接）</h2>
+
+<p><strong>REST API 示例：</strong></p>
+
+<table>
+<tr><th>方法</th><th>路径</th><th>说明</th></tr>
+<tr><td>GET</td><td>/api/tasks</td><td>获取所有任务列表</td></tr>
+<tr><td>POST</td><td>/api/tasks/{task_id}/run</td><td>立即执行任务</td></tr>
+<tr><td>POST</td><td>/api/tasks/{task_id}/pause</td><td>暂停任务</td></tr>
+<tr><td>POST</td><td>/api/tasks/{task_id}/incr</td><td>增量更新（传递日期、股票代码）</td></tr>
+</table>
+
+<p><strong>WebSocket 事件：</strong></p>
+<pre><code>// 前端订阅示例
+const ws = new WebSocket('ws://localhost:8080/ws')
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data)
+  if (msg.type === 'task_status') updateTaskStatus(msg.task_id, msg.status)
+  if (msg.type === 'new_log') appendLog(msg.task_id, msg.log_line)
+}
+</code></pre>
+
+<h2>六、技术选型总结</h2>
+
+<table>
+<tr><th>组件</th><th>技术</th><th>理由</th></tr>
+<tr><td>管理端</td><td>C++17 + libhv + ormpp</td><td>高性能（QPS 6W+）、低资源占用</td></tr>
+<tr><td>前端</td><td>Vue 3 + WebSocket</td><td>实时状态监控、组件化开发</td></tr>
+<tr><td>Agent (Linux/Win)</td><td>Python + subprocess</td><td>复用现有 ETL 脚本，零侵入</td></tr>
+<tr><td>数据库</td><td>MySQL + Redis</td><td>持久化 + 实时队列/缓存</td></tr>
+<tr><td>部署</td><td>Docker Compose</td><td>环境一致、快速迭代</td></tr>
+</table>
+
+<div class="note">
+<p><strong>说明：</strong> 以上内容完整覆盖系统架构、分布式节点设计、管理端代码示例、Docker 部署及前后端接口。用 Word 打开此 HTML 文件后，请使用“另存为”选择 Word 文档（.docx）格式，即可获得格式规整的 Word 文档。</p>
+</div>
+
+</body>
+</html>
